@@ -1,5 +1,5 @@
-// client.js — com suporte a TURN via backend (/ice)
-// (Cole este arquivo em public/client.js ou adapte seu HTML para carregá-lo)
+// client.js — com suporte a TURN via backend (/ice) + Quality (720p/1080p) + Fullscreen
+// (Cole este arquivo em public/client.js)
 
 const roomIdInput = document.getElementById('roomId');
 const createBtn = document.getElementById('createBtn');
@@ -33,61 +33,59 @@ function setStatus(s){ statusEl.innerText = s; }
 const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 const ICE_ENDPOINT = '/ice'; // endpoint backend que retorna iceServers
 
-let qualityMode = 'auto'; // 'auto' or 'high'
+// ----------------- QUALITY UI / CANVAS / BITRATE / FULLSCREEN -----------------
+let qualityMode = 'auto'; // 'auto' | 'high' | 'ultra'
 
-// cria UI de seleção de qualidade se não existir
-(function ensureQualityUI(){
+// cria UI de seleção de qualidade e botão de fullscreen (se não existir)
+(function ensureQualityAndFullscreenUI(){
   let container = document.getElementById('controls') || document.body;
-  // evita duplicar
-  if (document.getElementById('qualitySelect')) return;
-  const wrap = document.createElement('div');
-  wrap.style.display = 'inline-block';
-  wrap.style.marginLeft = '12px';
-  wrap.innerHTML = `
-    <label style="font-size:12px; margin-right:6px;">Qualidade:</label>
-    <select id="qualitySelect" title="Escolha qualidade do stream">
-      <option value="auto">Auto (padrão)</option>
-      <option value="high">Alta (720p, maior bitrate)</option>
-    </select>
-  `;
-  // append próximo aos botões principais se possível
-  if (document.getElementById('startStreamBtn')) {
-    document.getElementById('startStreamBtn').insertAdjacentElement('afterend', wrap);
-  } else {
-    container.appendChild(wrap);
+  if (!document.getElementById('qualitySelect')) {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'inline-block';
+    wrap.style.marginLeft = '12px';
+    wrap.innerHTML = `
+      <label style="font-size:12px; margin-right:6px;">Qualidade:</label>
+      <select id="qualitySelect" title="Escolha qualidade do stream">
+        <option value="auto">Auto (padrão)</option>
+        <option value="high">Alta (720p)</option>
+        <option value="ultra">Ultra (1080p)</option>
+      </select>
+      <button id="fsBtn" title="Fullscreen" style="margin-left:8px; display:none">⤢ Fullscreen</button>
+    `;
+    if (document.getElementById('startStreamBtn')) {
+      document.getElementById('startStreamBtn').insertAdjacentElement('afterend', wrap);
+    } else {
+      container.appendChild(wrap);
+    }
+    const sel = document.getElementById('qualitySelect');
+    sel.addEventListener('change', (e) => { setQualityMode(e.target.value); });
+
+    const fsBtn = document.getElementById('fsBtn');
+    fsBtn.addEventListener('click', () => toggleFullScreen());
+    // double click on player toggles fullscreen (counts as user gesture)
+    player.addEventListener('dblclick', () => toggleFullScreen());
   }
-  const sel = document.getElementById('qualitySelect');
-  sel.addEventListener('change', (e) => {
-    setQualityMode(e.target.value);
-  });
 })();
 
-// Cria canvas capture (força resolução/fps)
+// createCanvasCaptureFromPlayer: desenha o vídeo em um canvas na resolução desejada
 function createCanvasCaptureFromPlayer(targetWidth = 1280, targetHeight = 720, fps = 30) {
   const canvas = document.createElement('canvas');
   canvas.width = targetWidth;
   canvas.height = targetHeight;
-  // mantém canvas fora do DOM para não poluir a UI
   canvas.style.display = 'none';
   document.body.appendChild(canvas);
   const ctx = canvas.getContext('2d');
 
   let rafId = null;
   const draw = () => {
-    try {
-      ctx.drawImage(player, 0, 0, canvas.width, canvas.height);
-    } catch (e) {
-      // ignore se frame ainda não disponível
-    }
+    try { ctx.drawImage(player, 0, 0, canvas.width, canvas.height); } catch (e) {}
     rafId = requestAnimationFrame(draw);
   };
   rafId = requestAnimationFrame(draw);
 
   const stream = canvas.captureStream(fps);
-
   const stopAll = () => {
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-    // remove canvas do DOM após um pequeno timeout para garantir cleanup
     setTimeout(()=> { try { canvas.remove(); } catch(e){} }, 1000);
   };
   stream._stopCanvas = stopAll;
@@ -102,10 +100,11 @@ async function boostSenderParameters(pc, bitrate = 1500000) {
     if (!sender || !sender.getParameters) return false;
     const params = sender.getParameters();
     if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-    params.encodings[0].maxBitrate = bitrate; // ex: 1_500_000 = 1.5 Mbps
-    if (typeof params.encodings[0].maxFramerate === 'undefined') params.encodings[0].maxFramerate = 30;
+    params.encodings[0].maxBitrate = bitrate;
+    params.encodings[0].maxFramerate = 30;
+    params.encodings[0].scaleResolutionDownBy = 1.0;
     await sender.setParameters(params);
-    console.log('boostSenderParameters applied', bitrate, pc);
+    console.log('Sender params applied: ', bitrate);
     return true;
   } catch (e) {
     console.warn('boostSenderParameters failed', e);
@@ -113,46 +112,40 @@ async function boostSenderParameters(pc, bitrate = 1500000) {
   }
 }
 
-// aplica a qualidade escolhida: cria novo outgoingStream (se necessário),
-// substitui tracks nos peers e faz renegociação (ofertas) para todos os PCs.
+// aplica qualidade escolhida (auto/720/1080) com renegociação
 async function applyQualityToPeers(newMode) {
-  // decide novo stream source
-  let newStream = null;
-  let canvasController = null;
-  if (newMode === 'high') {
-    // 720p@30 por padrão; pode ajustar aqui se quiser (ex: 1280x720)
-    const { stream, stop, canvas } = createCanvasCaptureFromPlayer(1280, 720, 30);
-    newStream = stream;
-    canvasController = { stop, canvas };
+  let newStream = null, canvasController = null;
+  if (newMode === 'ultra') {
+    try {
+      const { stream, stop } = createCanvasCaptureFromPlayer(1920, 1080, 30);
+      newStream = stream;
+      canvasController = { stop };
+    } catch(e) { console.warn('criar canvas 1080p falhou', e); }
+  } else if (newMode === 'high') {
+    const { stream, stop } = createCanvasCaptureFromPlayer(1280, 720, 30);
+    newStream = stream; canvasController = { stop };
   } else {
-    // auto: usa player.captureStream (fallback se não suportado)
     if (typeof player.captureStream === 'function') {
       try { newStream = player.captureStream(); } catch(e){ console.warn('player.captureStream fail', e); newStream = null; }
     }
-    // se não suportar, tenta usar existing outgoingStream (no host)
     if (!newStream && outgoingStream) newStream = outgoingStream;
   }
 
-  if (!newStream) {
-    log('Nao foi possivel criar novo stream para qualidade ' + newMode);
-    return;
-  }
+  if (!newStream) { log('Nao foi possivel criar novo stream para qualidade ' + newMode); return; }
 
-  // Guarde referência antiga para cleanup
   const oldStream = outgoingStream;
-
-  // substitui outgoingStream (mas não para o canvas antigo aqui)
   outgoingStream = newStream;
   outgoingStream._canvasController = canvasController || null;
 
-  // Para cada peer: replaceTrack para video & audio, depois renegociar (offer)
+  const bitrateMap = { auto: 600000, high: 1500000, ultra: 3500000 };
+  const targetBitrate = bitrateMap[newMode] || 1500000;
+
   const peerIds = Array.from(peers.keys());
   for (const pid of peerIds) {
     const entry = peers.get(pid);
     if (!entry) continue;
     const pc = entry.pc;
 
-    // replace/add tracks
     for (const track of outgoingStream.getTracks()) {
       const sender = pc.getSenders().find(s => s.track && s.track.kind === track.kind);
       if (sender) {
@@ -162,25 +155,17 @@ async function applyQualityToPeers(newMode) {
       }
     }
 
-    // opcional: dropar antigos senders que não existam mais
-    // (não estritamente necessário)
+    await boostSenderParameters(pc, targetBitrate).catch(()=>{});
 
-    // tenta aumentar bitrate no sender
-    await boostSenderParameters(pc, 1500000).catch(()=>{});
-
-    // renegociação: cria offer após ajuste
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       const fp = (offer.sdp || '').slice(0,120);
       sendWS({ type:'offer', to: pid, from: myId, roomId, sdp: pc.localDescription, offerFingerprint: fp });
       log('Renegociação (offer) enviada para', pid, 'modo', newMode);
-    } catch (e) {
-      console.warn('Renegociação falhou para', pid, e);
-    }
+    } catch (e) { console.warn('reneg fail', e); }
   }
 
-  // para cleanup: finalize old stream (mas não remova objectURL do player)
   if (oldStream && oldStream !== newStream) {
     try {
       oldStream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
@@ -189,64 +174,66 @@ async function applyQualityToPeers(newMode) {
   }
 }
 
-// altera o modo de qualidade (chamado pela UI)
+// setQualityMode atualizada (chama applyQualityToPeers se host já estiver transmitindo)
 async function setQualityMode(mode) {
-  if (!['auto','high'].includes(mode)) return;
+  if (!['auto','high','ultra'].includes(mode)) return;
   qualityMode = mode;
   const sel = document.getElementById('qualitySelect');
   if (sel) sel.value = mode;
   log('Modo de qualidade definido para', mode);
 
-  // se host e já está transmitindo, aplica em tempo real
   if (isHost && outgoingStream) {
     log('Aplicando nova qualidade aos peers:', mode);
     await applyQualityToPeers(mode);
   }
 }
 
-// Modifique o fluxo do startStreamBtn: se qualidade === 'high' use canvas capture
-// Substitua a linha outgoingStream = player.captureStream(); pelo trecho abaixo
-// ou, caso não queira substituir manualmente, este bloco garante que ao iniciar
-// o stream ele respete a qualidade selecionada:
-
+// substitui startStream handler para respeitar qualidade escolhida
 const originalStartStreamHandler = startStreamBtn.onclick;
 startStreamBtn.onclick = async function wrappedStartStreamHandler(evt) {
-  // executa validações originais (se houver)
   try {
-    // Se o selecionador de qualidade já definiu modo 'high', crie canvas stream.
-    if (qualityMode === 'high') {
-      // tenta criar canvas capture
+    if (!isHost) return alert('Somente host pode iniciar o stream');
+    if (!player.src && !player.srcObject) return alert('Carregue um vídeo antes');
+    try { await player.play(); } catch(e){ console.warn('play failed', e); }
+
+    if (qualityMode === 'ultra') {
       try {
-        const { stream, stop } = createCanvasCaptureFromPlayer(1280, 720, 30);
+        const { stream, stop } = createCanvasCaptureFromPlayer(1920, 1080, 30);
         outgoingStream = stream;
         outgoingStream._stopCanvas = stop;
+        log('Usando canvas capture para qualidade ULTRA (1080p@30).');
+      } catch (e) {
+        console.warn('Falha canvas 1080p, fallback:', e);
+        if (typeof player.captureStream === 'function') outgoingStream = player.captureStream();
+      }
+    } else if (qualityMode === 'high') {
+      try {
+        const { stream, stop } = createCanvasCaptureFromPlayer(1280, 720, 30);
+        outgoingStream = stream; outgoingStream._stopCanvas = stop;
         log('Usando canvas capture para qualidade HIGH (720p@30).');
       } catch (e) {
-        console.warn('Falha ao criar canvas capture, fallback para captureStream()', e);
+        console.warn('Falha canvas 720p, fallback:', e);
         if (typeof player.captureStream === 'function') outgoingStream = player.captureStream();
       }
     } else {
-      // auto
       if (typeof player.captureStream === 'function') {
         outgoingStream = player.captureStream();
         log('Usando player.captureStream() (modo AUTO).');
       } else {
-        alert('captureStream() não disponível no navegador; use Chrome/Edge desktop ou escolha qualidade ALTA (canvas).');
+        alert('captureStream() não disponível neste navegador; use Chrome/Edge desktop ou escolha qualidade ALTA (canvas).');
         return;
       }
     }
-    // segue com o código original do startStream: anexar tracks e negociar
-    // replicamos a lógica que você já tinha: for each peer add/replace tracks and offer
+
     const toNegotiate = Array.from(new Set([...peers.keys(), ...pendingPeers]));
     pendingPeers.clear();
     for (const pid of toNegotiate) {
       const entry = peers.get(pid);
       if (!entry) {
         log('Criando PC para', pid, 'antes da negociação');
-        await createPC(pid, false); // create pc if missing
+        await createPC(pid, false);
       }
       const pc = peers.get(pid).pc;
-      // add/replace tracks
       for (const track of outgoingStream.getTracks()) {
         const sender = pc.getSenders().find(s => s.track && s.track.kind === track.kind);
         if (sender) {
@@ -255,9 +242,8 @@ startStreamBtn.onclick = async function wrappedStartStreamHandler(evt) {
           try { pc.addTrack(track, outgoingStream); } catch(e){ console.warn('addTrack fail', e); }
         }
       }
-      // apply bitrate boost
-      await boostSenderParameters(pc, 1500000).catch(()=>{});
-      // offer after tracks attached
+      const brMap = { auto: 600000, high: 1500000, ultra: 3500000 };
+      await boostSenderParameters(pc, brMap[qualityMode] || 1500000).catch(()=>{});
       try {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -267,7 +253,6 @@ startStreamBtn.onclick = async function wrappedStartStreamHandler(evt) {
       } catch(err){ console.warn('reneg fail', err); }
     }
 
-    // attach onended from outgoing video track if exists
     const vt = outgoingStream.getVideoTracks()[0];
     if (vt) vt.onended = () => { log('Stream finalizado pelo host'); sendWS({ type:'screen-stopped', roomId }); outgoingStream = null; };
 
@@ -275,9 +260,9 @@ startStreamBtn.onclick = async function wrappedStartStreamHandler(evt) {
     console.warn('Erro no wrappedStartStreamHandler', err);
   }
 
-  // call original handler if it existed (some older logic might be in original)
   try { if (typeof originalStartStreamHandler === 'function') originalStartStreamHandler.call(this, evt); } catch(e){}
 };
+// ---------------------------------------------------------------------------
 
 // ICE cache/refresh helper
 let ICE_CACHE = { expires: 0, iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -362,47 +347,7 @@ loadBtn.onclick = () => {
   log('Arquivo carregado (host). Use "Iniciar stream" para transmitir.');
 };
 
-// Host: start captureStream and attach tracks to peers
-startStreamBtn.onclick = async () => {
-  if (!isHost) return alert('Somente host pode iniciar o stream');
-  if (!player.src && !player.srcObject) return alert('Carregue um vídeo antes');
-  try { await player.play(); } catch(e){ console.warn('play failed', e); }
-  if (typeof player.captureStream !== 'function') {
-    alert('captureStream() não disponível neste navegador. Use Chrome/Edge desktop.');
-    return;
-  }
-  outgoingStream = player.captureStream();
-  log('captureStream() criado; anexando tracks aos peers e negociando.');
-
-  const toNegotiate = Array.from(new Set([...peers.keys(), ...pendingPeers]));
-  pendingPeers.clear();
-  for (const pid of toNegotiate) {
-    const entry = peers.get(pid);
-    if (!entry) {
-      log('Criando PC para', pid, 'antes da negociação');
-      await createPC(pid, false); // create pc if missing
-    }
-    const pc = peers.get(pid).pc;
-    for (const track of outgoingStream.getTracks()) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === track.kind);
-      if (sender) {
-        try { await sender.replaceTrack(track); } catch(e){ console.warn('replaceTrack fail', e); }
-      } else {
-        try { pc.addTrack(track, outgoingStream); } catch(e){ console.warn('addTrack fail', e); }
-      }
-    }
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const fp = (offer.sdp || '').slice(0,120);
-      sendWS({ type:'offer', to: pid, from: myId, roomId, sdp: pc.localDescription, offerFingerprint: fp });
-      log('Offer (com tracks) enviada para', pid);
-    } catch(err){ console.warn('reneg fail', err); }
-  }
-
-  const vt = outgoingStream.getVideoTracks()[0];
-  if (vt) vt.onended = () => { log('Stream finalizado pelo host'); sendWS({ type:'screen-stopped', roomId }); outgoingStream = null; };
-};
+// NOTE: startStreamBtn.onclick foi substituído acima pelo wrappedStartStreamHandler
 
 playBtn.onclick = async () => {
   if (!isHost) return;
@@ -541,6 +486,8 @@ async function createPC(peerId, makeOffer=false, remoteSdp=null) {
         player.srcObject = s;
         player.muted = true;
         player.play().catch(()=>{});
+        player.controls = true; // <-- habilita controles para convidado (fullscreen etc)
+        const fsBtn = document.getElementById('fsBtn'); if (fsBtn) fsBtn.style.display = 'inline-block';
         unmuteBtn.style.display = 'inline-block';
         log('Guest: stream remota aplicada ao player');
       } else {
